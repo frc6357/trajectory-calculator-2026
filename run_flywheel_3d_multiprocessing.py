@@ -8,6 +8,7 @@ optimal shooter angles and speeds, then visualizes the trajectory.
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from multiprocessing import Pool, cpu_count
 
 # ============================================================
 # Physical constants
@@ -57,6 +58,10 @@ SHOOTER_OFFSET_R = np.array(
 ROBOT_POS_Z_F = 0.0
 ROBOT_VEL_Z_F = 0.0
 
+# ============================================================
+# Multiprocessing settings
+# ============================================================
+NUM_PROCESSES = cpu_count()  # Use all available CPU cores
 
 # ============================================================
 # Rotation utilities
@@ -581,77 +586,97 @@ def simulate():
     scenario_count = 0
     successful_shots = 0
 
-    # for robot_x in robot_x_range:
-    #     for robot_y in robot_y_range:
-    #         for robot_yaw in robot_yaw_range:
-    #             for robot_vel_x in robot_vel_x_range:
-    #                 for robot_vel_y in robot_vel_y_range:
-    #                     scenario_count += 1
+    for robot_x in robot_x_range:
+        for robot_y in robot_y_range:
+            for robot_yaw in robot_yaw_range:
+                for robot_vel_x in robot_vel_x_range:
+                    for robot_vel_y in robot_vel_y_range:
+                        scenario_count += 1
 
-    #                     robot_pos_field = np.array([robot_x, robot_y, ROBOT_POS_Z_F])
-    #                     robot_yaw_field = robot_yaw
-    #                     robot_velocity_field = np.array(
-    #                         [robot_vel_x, robot_vel_y, ROBOT_VEL_Z_F]
-    #                     )
-    #                     shooter_offset_robot = SHOOTER_OFFSET_R
-    #                     hub_center_field = np.array([HUB_X, HUB_Y, HUB_Z])
+                        robot_pos_field = np.array([robot_x, robot_y, ROBOT_POS_Z_F])
+                        robot_yaw_field = robot_yaw
+                        robot_velocity_field = np.array(
+                            [robot_vel_x, robot_vel_y, ROBOT_VEL_Z_F]
+                        )
+                        shooter_offset_robot = SHOOTER_OFFSET_R
+                        hub_center_field = np.array([HUB_X, HUB_Y, HUB_Z])
 
-    #                     candidate = solve_shot_planar(
-    #                         robot_pos_field,
-    #                         robot_velocity_field,
-    #                         shooter_offset_robot,
-    #                         robot_yaw_field,
-    #                         hub_center_field,
-    #                     )
+                        candidate = solve_shot_planar(
+                            robot_pos_field,
+                            robot_velocity_field,
+                            shooter_offset_robot,
+                            robot_yaw_field,
+                            hub_center_field,
+                        )
 
-    #                     if candidate is not None:
-    #                         successful_shots += 1
-    #                         print(
-    #                             f"X={robot_x:.1f}m, Y={robot_y:.1f}m, Yaw={np.rad2deg(robot_yaw):.1f}°, ",
-    #                             f"VelX={robot_vel_x:.1f}m/s, VelY={robot_vel_y:.1f}m/s, ",
-    #                             f"Pitch={np.rad2deg(candidate.pitch_rad):.1f}°, ",
-    #                             f"Speed={candidate.flywheel_speed:.2f}m/s, Error={candidate.lateral_error:.3f}m",
-    #                         )
-    #
-    # print(f"\nTotal scenarios: {scenario_count}, Successful: {successful_shots}")
-    # return
-    # Step 1: Initialize robot state
-    # Robot position in field frame (right positive, forward positive, on floor)
-    robot_pos_field = np.array([0.3, 0.3, ROBOT_POS_Z_F])
-    # Robot yaw angle (positive counterclockwise)
-    robot_yaw_field = np.deg2rad(60)
-    # Robot velocity (right, forward, up)
-    robot_velocity_field = np.array([0, 0, ROBOT_VEL_Z_F])
-    # Shooter position relative to robot (front-right, elevated)
-    shooter_offset_robot = SHOOTER_OFFSET_R
-    # Hub center location
-    hub_center_field = np.array([HUB_X, HUB_Y, HUB_Z])
+                        if candidate is not None:
+                            successful_shots += 1
+                            print(
+                                f"X={robot_x:.1f}m, Y={robot_y:.1f}m, Yaw={np.rad2deg(robot_yaw):.1f}°, ",
+                                f"VelX={robot_vel_x:.1f}m/s, VelY={robot_vel_y:.1f}m/s, ",
+                                f"Pitch={np.rad2deg(candidate.pitch_rad):.1f}°, ",
+                                f"Speed={candidate.flywheel_speed:.2f}m/s, Error={candidate.lateral_error:.3f}m",
+                            )
+    
+    print(f"\nTotal scenarios: {scenario_count}, Successful: {successful_shots}")
 
-    # Step 2: Solve for optimal shot configuration
-    candidate = solve_shot_planar(
-        robot_pos_field,
-        robot_velocity_field,
-        shooter_offset_robot,
-        robot_yaw_field,
-        hub_center_field,
-    )
-
-    # Step 3: Display results
-    print(
-        f"Pitch: {np.rad2deg(candidate.pitch_rad):.1f} deg, Flywheel: {candidate.flywheel_speed:.2f} m/s"
-    )
-
-    # Step 4: Create and display animation
-    animate_candidate(
-        candidate,
-        robot_pos_field,
-        robot_yaw_field,
-        robot_velocity_field,
-        shooter_offset_robot,
-        hub_center_field,
-    )
-
+def process_scenarios(chunk):
+    """Process a chunk of scenarios and return results."""
+    successful = 0
+    for robot_x, robot_y, robot_yaw, robot_vel_x, robot_vel_y in chunk:
+        robot_pos_field = np.array([robot_x, robot_y, ROBOT_POS_Z_F])
+        robot_velocity_field = np.array([robot_vel_x, robot_vel_y, ROBOT_VEL_Z_F])
+        hub_center_field = np.array([HUB_X, HUB_Y, HUB_Z])
+        
+        candidate = solve_shot_planar(
+            robot_pos_field,
+            robot_velocity_field,
+            SHOOTER_OFFSET_R,
+            robot_yaw,
+            hub_center_field,
+        )
+        
+        if candidate is not None:
+            successful += 1
+            print(
+                f"X={robot_x:.1f}m, Y={robot_y:.1f}m, Yaw={np.rad2deg(robot_yaw):.1f}°, "
+                f"VelX={robot_vel_x:.1f}m/s, VelY={robot_vel_y:.1f}m/s, "
+                f"Pitch={np.rad2deg(candidate.pitch_rad):.1f}°, "
+                f"Speed={candidate.flywheel_speed:.2f}m/s, Error={candidate.lateral_error:.3f}m"
+            )
+    return successful
 
 # Entry point for script execution
 if __name__ == "__main__":
-    simulate()
+    # Create parameter ranges for scenario simulation
+    robot_x_range = np.linspace(1.0, 4.0, 4)
+    robot_y_range = np.linspace(0, 8, 4)
+    robot_yaw_range = np.linspace(-np.deg2rad(60), np.deg2rad(60), 3)
+    robot_vel_x_range = np.linspace(0, 4.0, 4)
+    robot_vel_y_range = np.linspace(0, 4.0, 4)
+    
+    # Generate all parameter combinations
+    scenarios = [
+        (robot_x, robot_y, robot_yaw, robot_vel_x, robot_vel_y)
+        for robot_x in robot_x_range
+        for robot_y in robot_y_range
+        for robot_yaw in robot_yaw_range
+        for robot_vel_x in robot_vel_x_range
+        for robot_vel_y in robot_vel_y_range
+    ]
+    
+    # Split scenarios into 4 chunks
+    chunk_size = len(scenarios) // NUM_PROCESSES
+    scenario_chunks = [
+        scenarios[i*chunk_size:(i+1)*chunk_size] if i < NUM_PROCESSES - 1 else scenarios[i*chunk_size:]
+        for i in range(NUM_PROCESSES)
+    ]
+    
+    print("Starting multiprocessing simulation...")
+    # Use multiprocessing pool with NUM_PROCESSES processes
+    with Pool(NUM_PROCESSES) as pool:
+        results = pool.map(process_scenarios, scenario_chunks)
+    
+    total_scenarios = len(scenarios)
+    total_successful = sum(results)
+    print(f"\nTotal scenarios: {total_scenarios}, Successful: {total_successful}")
