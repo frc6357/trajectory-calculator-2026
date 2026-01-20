@@ -9,6 +9,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from multiprocessing import Pool, cpu_count
+import cupy as cp
+
+
 
 # ============================================================
 # Physical constants
@@ -62,6 +65,8 @@ ROBOT_VEL_Z_F = 0.0
 # Multiprocessing settings
 # ============================================================
 NUM_PROCESSES = cpu_count()  # Use all available CPU cores
+print("CUDA_PATH:", cp.cuda.get_cuda_path())
+print("GPU TARGET:", cp.cuda.get_device_id()) # Make sure you don't try to use the CPU integrated graphics
 
 # ============================================================
 # Rotation utilities
@@ -216,9 +221,8 @@ def solve_shot_planar(
     tol_lateral=0.01,
 ):
     """
-    Iterative solver for optimal shooter configuration using planar velocity
-    cancellation and pitch optimization. Searches parameter space (yaw, pitch, speed)
-    and iteratively refines around the best candidate.
+    Iterative solver for optimal shooter configuration using GPU acceleration with CuPy.
+    Searches parameter space (yaw, pitch, speed) and iteratively refines around best candidate.
 
     All quantities are expressed in the FIELD frame unless suffixed with _R (robot frame).
 
@@ -234,30 +238,34 @@ def solve_shot_planar(
     Returns:
         ShotCandidate: Best shot configuration found, or None if no valid shot
     """
+        
+    # Convert inputs to GPU arrays
+    robot_pos_F_gpu = cp.asarray(robot_pos_F, dtype=cp.float32)
+    robot_vel_F_gpu = cp.asarray(robot_vel_F, dtype=cp.float32)
+    shooter_offset_R_gpu = cp.asarray(shooter_offset_R, dtype=cp.float32)
+    hub_center_F_gpu = cp.asarray(hub_center_F, dtype=cp.float32)
 
-    # Step 1: Calculate shooter position in field frame
-    # Convert from robot frame to field frame using robot's yaw rotation
+    # Step 1: Calculate shooter position in field frame on GPU
     c, s = np.cos(robot_yaw_F), np.sin(robot_yaw_F)
-    R_FR = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-    shooter_pos_F = robot_pos_F + R_FR @ shooter_offset_R
+    R_FR_gpu = cp.asarray([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=cp.float32)
+    shooter_pos_F_gpu = robot_pos_F_gpu + R_FR_gpu @ shooter_offset_R_gpu
 
     best = None
 
     # Step 2: Coarse initial search centered on hub bearing
-    # Calculate bearing angle from shooter to hub center
-    hub_bearing_F = np.arctan2(
-        hub_center_F[1] - shooter_pos_F[1], hub_center_F[0] - shooter_pos_F[0]
+    hub_bearing_F = float(
+        cp.arctan2(
+            hub_center_F_gpu[1] - shooter_pos_F_gpu[1],
+            hub_center_F_gpu[0] - shooter_pos_F_gpu[0],
+        )
     )
-    # Convert to relative yaw (shooter yaw relative to robot yaw)
     initial_yaw_rel = hub_bearing_F - robot_yaw_F
-    # Create search grid: yaw ±30° around hub bearing
-    yaw_values = np.linspace(
+
+    yaw_values = cp.linspace(
         initial_yaw_rel - np.deg2rad(30), initial_yaw_rel + np.deg2rad(30), 100
     )
-    # Search grid: pitch from PITCH_MIN to PITCH_MAX
-    pitch_values = np.linspace(PITCH_MIN, PITCH_MAX, 50)
-    # Search grid: flywheel speed across full operational range
-    speed_values = np.linspace(
+    pitch_values = cp.linspace(PITCH_MIN, PITCH_MAX, 50)
+    speed_values = cp.linspace(
         FLYWHEEL_MIN_SPEED_M_PER_S, FLYWHEEL_MAX_SPEED_M_PER_S, 50
     )
 
@@ -265,104 +273,118 @@ def solve_shot_planar(
     for _ in range(max_iterations):
         improved = False
 
-        # Step 3a: Test all combinations in current search grid
-        for yaw_rel in yaw_values:
-            # Calculate absolute yaw angle in field frame
-            shooter_yaw_F = robot_yaw_F + yaw_rel
+        # Vectorized computation for all combinations
+        yaw_grid, pitch_grid, speed_grid = cp.meshgrid(
+            yaw_values, pitch_values, speed_values, indexing="ij"
+        )
 
-            # Horizontal aim direction (unit vector in field frame)
-            aim_xy_F = np.array([np.cos(shooter_yaw_F), np.sin(shooter_yaw_F)])
+        # Flatten grids for batch processing
+        yaw_flat = yaw_grid.flatten()
+        pitch_flat = pitch_grid.flatten()
+        speed_flat = speed_grid.flatten()
 
-            for pitch in pitch_values:
-                cos_p = np.cos(pitch)
-                sin_p = np.sin(pitch)
+        # Calculate shooter yaw in field frame (vectorized)
+        shooter_yaw_F_gpu = robot_yaw_F + yaw_flat
 
-                for v_f in speed_values:
-                    # Step 3b: Calculate initial projectile velocity in field frame
-                    # Velocity = robot velocity + flywheel velocity contribution
-                    v0_F = np.array(
-                        [
-                            robot_vel_F[0] + v_f * cos_p * aim_xy_F[0],
-                            robot_vel_F[1] + v_f * cos_p * aim_xy_F[1],
-                            v_f * sin_p,
-                        ]
-                    )
+        # Vectorized aim direction
+        aim_xy_F_gpu = cp.stack(
+            [cp.cos(shooter_yaw_F_gpu), cp.sin(shooter_yaw_F_gpu)], axis=1
+        )
 
-                    # Step 3c: Solve for intersection with hub height plane
-                    # Equation: z(t) = z0 + vz*t - 0.5*g*t^2 = HUB_Z
-                    a = -0.5 * G
-                    b = v0_F[2]
-                    c_z = shooter_pos_F[2] - HUB_Z
-                    disc = b * b - 4 * a * c_z
-                    if disc < 0:
-                        continue
+        # Vectorized pitch calculations
+        cos_p_gpu = cp.cos(pitch_flat)
+        sin_p_gpu = cp.sin(pitch_flat)
 
-                    # Get both possible intersection times and filter valid ones
-                    t_candidates = [
-                        t
-                        for t in (
-                            (-b - np.sqrt(disc)) / (2 * a),
-                            (-b + np.sqrt(disc)) / (2 * a),
-                        )
-                        if t > 0
-                    ]
-                    if not t_candidates:
-                        continue
+        # Vectorized velocity calculations
+        v0_x = (
+            robot_vel_F_gpu[0]
+            + speed_flat * cos_p_gpu * aim_xy_F_gpu[:, 0]
+        )
+        v0_y = (
+            robot_vel_F_gpu[1]
+            + speed_flat * cos_p_gpu * aim_xy_F_gpu[:, 1]
+        )
+        v0_z = speed_flat * sin_p_gpu
 
-                    # Use latest impact time (when projectile is descending)
-                    t_hit = max(t_candidates)
+        # Solve quadratic for plane intersection (vectorized)
+        a_gpu = cp.full_like(v0_z, -0.5 * G)
+        b_gpu = v0_z
+        c_gpu = cp.full_like(v0_z, shooter_pos_F_gpu[2] - HUB_Z)
 
-                    # Step 3d: Verify projectile is descending at impact
-                    if v0_F[2] - G * t_hit >= 0:
-                        continue
+        disc_gpu = b_gpu * b_gpu - 4 * a_gpu * c_gpu
 
-                    # Step 3e: Calculate impact point
-                    p_hit_F = (
-                        shooter_pos_F
-                        + v0_F * t_hit
-                        + np.array([0, 0, -0.5 * G * t_hit**2])
-                    )
+        # Valid candidates have non-negative discriminant
+        valid_mask = disc_gpu >= 0
 
-                    # Step 3f: Calculate lateral error (horizontal distance to hub)
-                    lateral_error = np.linalg.norm(p_hit_F[:2] - hub_center_F[:2])
+        # Calculate intersection times
+        t_hit_gpu = cp.full_like(disc_gpu, -1.0, dtype=cp.float32)
+        t_hit_gpu[valid_mask] = (
+            (-b_gpu[valid_mask] - cp.sqrt(disc_gpu[valid_mask]))
+            / (2 * a_gpu[valid_mask])
+        )
 
-                    # Step 3g: Create shot candidate and check if it's better than current best
-                    candidate = ShotCandidate(
-                        yaw_rad=shooter_yaw_F,
-                        pitch_rad=pitch,
-                        flywheel_speed=v_f,
-                        time_hit=t_hit,
-                        lateral_error=lateral_error,
-                        descending=True,
-                    )
+        # Filter: t > 0
+        valid_mask &= t_hit_gpu > 0
 
-                    if best is None or candidate.cost < best.cost:
-                        best = candidate
-                        improved = True
+        # Filter: projectile must be descending
+        vz_at_impact = v0_z - G * t_hit_gpu
+        valid_mask &= vz_at_impact < 0
 
-        # Step 4: Check convergence conditions
-        # If we have a solution within tolerance, we're done
+        # Calculate impact points (vectorized)
+        p_hit_x = shooter_pos_F_gpu[0] + v0_x * t_hit_gpu + 0
+        p_hit_y = shooter_pos_F_gpu[1] + v0_y * t_hit_gpu + 0
+        p_hit_z = (
+            shooter_pos_F_gpu[2]
+            + v0_z * t_hit_gpu
+            - 0.5 * G * t_hit_gpu**2
+        )
+
+        # Calculate lateral errors (vectorized)
+        lateral_errors = cp.sqrt(
+            (p_hit_x - hub_center_F_gpu[0]) ** 2
+            + (p_hit_y - hub_center_F_gpu[1]) ** 2
+        )
+
+        # Zero out invalid candidates
+        lateral_errors[~valid_mask] = 1e9
+
+        # Find best candidate on GPU
+        best_idx = cp.argmin(lateral_errors)
+        best_lateral_error = float(lateral_errors[best_idx])
+
+        # Only process if valid
+        if best_lateral_error < 1e9:
+            candidate = ShotCandidate(
+                yaw_rad=float(shooter_yaw_F_gpu[best_idx]),
+                pitch_rad=float(pitch_flat[best_idx]),
+                flywheel_speed=float(speed_flat[best_idx]),
+                time_hit=float(t_hit_gpu[best_idx]),
+                lateral_error=best_lateral_error,
+                descending=True,
+            )
+
+            if best is None or candidate.cost < best.cost:
+                best = candidate
+                improved = True
+
+        # Step 4: Check convergence
         if best and best.lateral_error <= tol_lateral:
             break
 
-        # If no improvement was made, we've converged
         if not improved:
             break
 
-        # Step 5: Refine search grid around best candidate for next iteration
+        # Step 5: Refine search grid on GPU
         best_yaw_rel = best.yaw_rad - robot_yaw_F
-        # Narrow search to ±5° around best yaw
-        yaw_values = np.linspace(
+        yaw_values = cp.linspace(
             best_yaw_rel - np.deg2rad(5), best_yaw_rel + np.deg2rad(5), 12
         )
-        # Narrow search to ±0.05 rad around best pitch
-        pitch_values = np.linspace(
+        pitch_values = cp.linspace(
             max(PITCH_MIN, best.pitch_rad - 0.05),
             min(PITCH_MAX, best.pitch_rad + 0.05),
             12,
         )
-        # Narrow search to ±0.5 m/s around best speed
-        speed_values = np.linspace(
+        speed_values = cp.linspace(
             max(FLYWHEEL_MIN_SPEED_M_PER_S, best.flywheel_speed - 0.5),
             min(FLYWHEEL_MAX_SPEED_M_PER_S, best.flywheel_speed + 0.5),
             12,
@@ -601,13 +623,14 @@ def simulate():
                         shooter_offset_robot = SHOOTER_OFFSET_R
                         hub_center_field = np.array([HUB_X, HUB_Y, HUB_Z])
 
-                        candidate = solve_shot_planar(
-                            robot_pos_field,
-                            robot_velocity_field,
-                            shooter_offset_robot,
-                            robot_yaw_field,
-                            hub_center_field,
-                        )
+                        with cp.cuda.Device(0):
+                            candidate = solve_shot_planar(
+                                robot_pos_field,
+                                robot_velocity_field,
+                                shooter_offset_robot,
+                                robot_yaw_field,
+                                hub_center_field,
+                            )
 
                         if candidate is not None:
                             successful_shots += 1
@@ -648,35 +671,4 @@ def process_scenarios(chunk):
 
 # Entry point for script execution
 if __name__ == "__main__":
-    # Create parameter ranges for scenario simulation
-    robot_x_range = np.linspace(1.0, 4.0, 4)
-    robot_y_range = np.linspace(0, 8, 4)
-    robot_yaw_range = np.linspace(-np.deg2rad(60), np.deg2rad(60), 3)
-    robot_vel_x_range = np.linspace(0, 4.0, 4)
-    robot_vel_y_range = np.linspace(0, 4.0, 4)
-    
-    # Generate all parameter combinations
-    scenarios = [
-        (robot_x, robot_y, robot_yaw, robot_vel_x, robot_vel_y)
-        for robot_x in robot_x_range
-        for robot_y in robot_y_range
-        for robot_yaw in robot_yaw_range
-        for robot_vel_x in robot_vel_x_range
-        for robot_vel_y in robot_vel_y_range
-    ]
-    
-    # Split scenarios into 4 chunks
-    chunk_size = len(scenarios) // NUM_PROCESSES
-    scenario_chunks = [
-        scenarios[i*chunk_size:(i+1)*chunk_size] if i < NUM_PROCESSES - 1 else scenarios[i*chunk_size:]
-        for i in range(NUM_PROCESSES)
-    ]
-    
-    print("Starting multiprocessing simulation...")
-    # Use multiprocessing pool with NUM_PROCESSES processes
-    with Pool(NUM_PROCESSES) as pool:
-        results = pool.map(process_scenarios, scenario_chunks)
-    
-    total_scenarios = len(scenarios)
-    total_successful = sum(results)
-    print(f"\nTotal scenarios: {total_scenarios}, Successful: {total_successful}")
+    simulate()
