@@ -229,7 +229,7 @@ def solve_shot_planar(
     Parameters:
         robot_pos_F: Robot position [x, y, z] in field frame
         robot_vel_F: Robot velocity [vx, vy, vz] in field frame
-        shooter_offset_R: Shooter position relative to robot in robot frame
+        shooter_offset_R: Shooter position [x, y, z] relative to robot in robot frame
         robot_yaw_F: Robot yaw angle in radians (field frame)
         hub_center_F: Hub center position [x, y, z] in field frame
         max_iterations: Maximum refinement iterations
@@ -247,8 +247,10 @@ def solve_shot_planar(
 
     # Step 1: Calculate shooter position in field frame on GPU
     c, s = np.cos(robot_yaw_F), np.sin(robot_yaw_F)
-    R_FR_gpu = cp.asarray([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=cp.float32)
-    shooter_pos_F_gpu = robot_pos_F_gpu + R_FR_gpu @ shooter_offset_R_gpu
+    R_FR = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    shooter_pos_F = robot_pos_F + R_FR @ shooter_offset_R
+    shooter_pos_F_gpu = cp.asarray(shooter_pos_F, dtype=cp.float32)
 
     best = None
 
