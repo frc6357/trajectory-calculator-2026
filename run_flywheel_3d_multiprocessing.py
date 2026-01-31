@@ -9,6 +9,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from multiprocessing import Pool, cpu_count
+import csv
+import os
 
 # ============================================================
 # Physical constants
@@ -36,8 +38,8 @@ HUB_Y = 4.6116
 # Shooter constraints
 # ============================================================
 # Minimum and maximum pitch angles the shooter can achieve
-PITCH_MIN = np.deg2rad(45)
-PITCH_MAX = np.deg2rad(55)
+PITCH_MIN = np.deg2rad(50)
+PITCH_MAX = np.deg2rad(50)
 # Minimum and maximum flywheel speeds in meters per second
 FLYWHEEL_MIN_SPEED_M_PER_S = 1.0
 FLYWHEEL_MAX_SPEED_M_PER_S = 10.0
@@ -47,6 +49,9 @@ FLYWHEEL_SPEEDS = np.linspace(
 )  # m/s
 # Number of flywheel speed steps to test (used in some search variants)
 FLYWHEEL_STEPS = 20
+
+# Maximum tolerated error (in meters) for determining if a shot candidate is valid
+MAX_LATERAL_ERROR = 0.585   #0.5969
 
 SHOOTER_OFFSET_R = np.array(
     [0.3, 0.0, 0.65]
@@ -368,6 +373,9 @@ def solve_shot_planar(
             12,
         )
 
+    if(best.lateral_error > MAX_LATERAL_ERROR):
+        return None
+
     return best
 
 
@@ -622,7 +630,7 @@ def simulate():
 
 def process_scenarios(chunk):
     """Process a chunk of scenarios and return results."""
-    successful = 0
+    results = []
     for robot_x, robot_y, robot_yaw, robot_vel_x, robot_vel_y in chunk:
         robot_pos_field = np.array([robot_x, robot_y, ROBOT_POS_Z_F])
         robot_velocity_field = np.array([robot_vel_x, robot_vel_y, ROBOT_VEL_Z_F])
@@ -637,23 +645,26 @@ def process_scenarios(chunk):
         )
         
         if candidate is not None:
-            successful += 1
-            print(
-                f"X={robot_x:.1f}m, Y={robot_y:.1f}m, Yaw={np.rad2deg(robot_yaw):.1f}°, "
-                f"VelX={robot_vel_x:.1f}m/s, VelY={robot_vel_y:.1f}m/s, "
-                f"Pitch={np.rad2deg(candidate.pitch_rad):.1f}°, "
-                f"Speed={candidate.flywheel_speed:.2f}m/s, Error={candidate.lateral_error:.3f}m"
-            )
-    return successful
+            results.append({
+                'robot_x': robot_x,
+                'robot_y': robot_y,
+                'robot_yaw_deg': np.rad2deg(robot_yaw),
+                'robot_vel_x': robot_vel_x,
+                'robot_vel_y': robot_vel_y,
+                'pitch_deg': np.rad2deg(candidate.pitch_rad),
+                'flywheel_speed': candidate.flywheel_speed,
+                'lateral_error': candidate.lateral_error
+            })
+    return results
 
 # Entry point for script execution
 if __name__ == "__main__":
     # Create parameter ranges for scenario simulation
-    robot_x_range = np.linspace(1.0, 4.0, 4)
-    robot_y_range = np.linspace(0, 8, 4)
-    robot_yaw_range = np.linspace(-np.deg2rad(60), np.deg2rad(60), 3)
-    robot_vel_x_range = np.linspace(0, 4.0, 4)
-    robot_vel_y_range = np.linspace(0, 4.0, 4)
+    robot_x_range = np.linspace(0, 3.96, 5)
+    robot_y_range = np.linspace(0, 8.07, 5)
+    robot_yaw_range = np.linspace(0, 0, 1)
+    robot_vel_x_range = np.linspace(0, 3.0, 4)
+    robot_vel_y_range = np.linspace(0, 3.0, 4)
     
     # Generate all parameter combinations
     scenarios = [
@@ -677,6 +688,23 @@ if __name__ == "__main__":
     with Pool(NUM_PROCESSES) as pool:
         results = pool.map(process_scenarios, scenario_chunks)
     
+    # Flatten results from all processes
+    all_results = []
+    for chunk_results in results:
+        all_results.extend(chunk_results)
+    
+    # Write results to CSV file in the same directory as the script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, 'trajectory_results.csv')
+    
+    with open(csv_path, 'w', newline='') as csvfile:
+        fieldnames = ['robot_x', 'robot_y', 'robot_yaw_deg', 'robot_vel_x', 'robot_vel_y', 
+                      'pitch_deg', 'flywheel_speed', 'lateral_error']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_results)
+    
     total_scenarios = len(scenarios)
-    total_successful = sum(results)
+    total_successful = len(all_results)
     print(f"\nTotal scenarios: {total_scenarios}, Successful: {total_successful}")
+    print(f"Results written to: {csv_path}")
