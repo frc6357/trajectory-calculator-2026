@@ -8,7 +8,7 @@ optimal shooter angles and speeds, then visualizes the trajectory.
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Value
 import csv
 import os
 
@@ -67,6 +67,8 @@ ROBOT_VEL_Z_F = 0.0
 # Multiprocessing settings
 # ============================================================
 NUM_PROCESSES = cpu_count()  # Use all available CPU cores
+
+shot_num = 0  # Global shot counter for multiprocessing
 
 # ============================================================
 # Rotation utilities
@@ -628,8 +630,17 @@ def simulate():
     
     print(f"\nTotal scenarios: {scenario_count}, Successful: {successful_shots}")
 
+# Global counter for tracking shots across processes
+shot_counter = None
+
+def init_worker(counter):
+    """Initialize worker process with shared counter."""
+    global shot_counter
+    shot_counter = counter
+
 def process_scenarios(chunk):
     """Process a chunk of scenarios and return results."""
+    global shot_counter
     results = []
     for robot_x, robot_y, robot_yaw, robot_vel_x, robot_vel_y in chunk:
         robot_pos_field = np.array([robot_x, robot_y, ROBOT_POS_Z_F])
@@ -643,6 +654,11 @@ def process_scenarios(chunk):
             robot_yaw,
             hub_center_field,
         )
+        with shot_counter.get_lock():
+            shot_counter.value += 1
+            shot_num = shot_counter.value
+
+        print(f"Processed shot #{shot_num} out of {num_field_positions**2 * num_velocities**2 * num_rotations}", end='\r')
         
         if candidate is not None:
             results.append({
@@ -657,14 +673,18 @@ def process_scenarios(chunk):
             })
     return results
 
+num_field_positions = 6
+num_velocities = 5
+num_rotations = 1
+
 # Entry point for script execution
 if __name__ == "__main__":
     # Create parameter ranges for scenario simulation
-    robot_x_range = np.linspace(0, 3.96, 5)
-    robot_y_range = np.linspace(0, 8.07, 5)
-    robot_yaw_range = np.linspace(0, 0, 1)
-    robot_vel_x_range = np.linspace(0, 3.0, 4)
-    robot_vel_y_range = np.linspace(0, 3.0, 4)
+    robot_x_range = np.linspace(0, 3.96, num_field_positions)
+    robot_y_range = np.linspace(0, 8.07, num_field_positions)
+    robot_yaw_range = np.linspace(0, 0, num_rotations)
+    robot_vel_x_range = np.linspace(0, 3.0, num_velocities)
+    robot_vel_y_range = np.linspace(0, 3.0, num_velocities)
     
     # Generate all parameter combinations
     scenarios = [
@@ -684,8 +704,10 @@ if __name__ == "__main__":
     ]
     
     print("Starting multiprocessing simulation...")
+    # Create shared counter for tracking shots across processes
+    counter = Value('i', 0)
     # Use multiprocessing pool with NUM_PROCESSES processes
-    with Pool(NUM_PROCESSES) as pool:
+    with Pool(NUM_PROCESSES, initializer=init_worker, initargs=(counter,)) as pool:
         results = pool.map(process_scenarios, scenario_chunks)
     
     # Flatten results from all processes
