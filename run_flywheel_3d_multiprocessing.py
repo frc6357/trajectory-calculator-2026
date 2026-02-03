@@ -376,9 +376,11 @@ def solve_shot_planar(
         )
 
     if(best.lateral_error > MAX_LATERAL_ERROR):
-        return None
+        # Return the failed shot with a flag indicating it was rejected
+        return (False, best, np.hypot(robot_vel_F[0], robot_vel_F[1]), 
+                np.hypot(robot_pos_F[0]-hub_center_F[0], robot_pos_F[1]-hub_center_F[1]))
 
-    return best
+    return (True, best, None, None)
 
 
 # ============================================================
@@ -642,12 +644,13 @@ def process_scenarios(chunk):
     """Process a chunk of scenarios and return results."""
     global shot_counter
     results = []
+    failed_results = []
     for robot_x, robot_y, robot_yaw, robot_vel_x, robot_vel_y in chunk:
         robot_pos_field = np.array([robot_x, robot_y, ROBOT_POS_Z_F])
         robot_velocity_field = np.array([robot_vel_x, robot_vel_y, ROBOT_VEL_Z_F])
         hub_center_field = np.array([HUB_X, HUB_Y, HUB_Z])
         
-        candidate = solve_shot_planar(
+        result = solve_shot_planar(
             robot_pos_field,
             robot_velocity_field,
             SHOOTER_OFFSET_R,
@@ -660,18 +663,34 @@ def process_scenarios(chunk):
 
         print(f"Processed shot #{shot_num} out of {num_field_positions**2 * num_velocities**2 * num_rotations}", end='\r')
         
-        if candidate is not None:
-            results.append({
-                'robot_x': robot_x,
-                'robot_y': robot_y,
-                'robot_yaw_deg': np.rad2deg(robot_yaw),
-                'robot_vel_x': robot_vel_x,
-                'robot_vel_y': robot_vel_y,
-                'pitch_deg': np.rad2deg(candidate.pitch_rad),
-                'flywheel_speed': candidate.flywheel_speed,
-                'lateral_error': candidate.lateral_error
-            })
-    return results
+        if result is not None:
+            success, candidate, vel_magnitude, distance = result
+            if success:
+                results.append({
+                    'robot_x': robot_x,
+                    'robot_y': robot_y,
+                    'robot_yaw_deg': np.rad2deg(robot_yaw),
+                    'robot_vel_x': robot_vel_x,
+                    'robot_vel_y': robot_vel_y,
+                    'pitch_deg': np.rad2deg(candidate.pitch_rad),
+                    'flywheel_speed': candidate.flywheel_speed,
+                    'lateral_error': candidate.lateral_error,
+                    'turret_yaw_F_deg': np.rad2deg(candidate.yaw_rad)
+                })
+            else:
+                failed_results.append({
+                    'robot_x': robot_x,
+                    'robot_y': robot_y,
+                    'robot_yaw_deg': np.rad2deg(robot_yaw),
+                    'robot_vel_x': robot_vel_x,
+                    'robot_vel_y': robot_vel_y,
+                    'velocity_magnitude': vel_magnitude,
+                    'distance_to_hub': distance,
+                    'pitch_deg': np.rad2deg(candidate.pitch_rad),
+                    'flywheel_speed': candidate.flywheel_speed,
+                    'lateral_error': candidate.lateral_error
+                })
+    return results, failed_results
 
 num_field_positions = 6
 num_velocities = 5
@@ -712,8 +731,10 @@ if __name__ == "__main__":
     
     # Flatten results from all processes
     all_results = []
-    for chunk_results in results:
+    all_failed_results = []
+    for chunk_results, chunk_failed in results:
         all_results.extend(chunk_results)
+        all_failed_results.extend(chunk_failed)
     
     # Write results to CSV file in the same directory as the script
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -721,12 +742,24 @@ if __name__ == "__main__":
     
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = ['robot_x', 'robot_y', 'robot_yaw_deg', 'robot_vel_x', 'robot_vel_y', 
-                      'pitch_deg', 'flywheel_speed', 'lateral_error']
+                      'pitch_deg', 'flywheel_speed', 'lateral_error', 'turret_yaw_F_deg']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_results)
     
+    # Write failed shots to separate CSV file
+    failed_csv_path = os.path.join(script_dir, 'failed_shots.csv')
+    
+    with open(failed_csv_path, 'w', newline='') as csvfile:
+        fieldnames = ['robot_x', 'robot_y', 'robot_yaw_deg', 'robot_vel_x', 'robot_vel_y',
+                      'velocity_magnitude', 'distance_to_hub', 'pitch_deg', 'flywheel_speed', 'lateral_error']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_failed_results)
+    
     total_scenarios = len(scenarios)
     total_successful = len(all_results)
-    print(f"\nTotal scenarios: {total_scenarios}, Successful: {total_successful}")
+    total_failed = len(all_failed_results)
+    print(f"\nTotal scenarios: {total_scenarios}, Successful: {total_successful}, Failed: {total_failed}")
     print(f"Results written to: {csv_path}")
+    print(f"Failed shots written to: {failed_csv_path}")
